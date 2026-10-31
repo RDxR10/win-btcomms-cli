@@ -23,7 +23,7 @@ powershell -ep bypass -f ./win_btshare.ps1 -Mode scan -ScanSeconds 30 -ShowAll
 ### Send a file
 
 ```powershell
-powershell -ep bypass -f ./win_btshare.ps1 -Mode send -FilePath "D:\file.pdf" -DeviceName "MyPhone"
+powershell -ep bypass -f ./win_btshare.ps1 -Mode send -FilePath "D:\file.pdf" -DeviceName "MyDevice"
 powershell -ep bypass -f ./win_btshare.ps1 -Mode send -FilePath "D:\file.pdf" -DeviceAddress <HH:HH:HH:HH:HH:HH | HHHHHHHHHHHH>
 ```
 
