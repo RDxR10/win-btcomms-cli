@@ -488,7 +488,7 @@ function Send-BluetoothFile {
         $services = @($res.Services)
 
         if ($services.Count -eq 0) {
-            Write-Host 'Object Push service not found. Listing every RFCOMM service the phone reports...' -ForegroundColor Yellow
+            Write-Host 'Object Push service not found. Listing every RFCOMM service the device reports...' -ForegroundColor Yellow
             try {
                 $all = Await-Op ($dev.GetRfcommServicesAsync([Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached)) ([Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult])
                 $allServices = @($all.Services)
@@ -502,7 +502,7 @@ function Send-BluetoothFile {
             catch {
                 Write-Host "  Could not list services: $($_.Exception.Message)"
             }
-            throw 'The device does not offer an Object Push service to this script. Make sure the phone is paired, unlocked, Bluetooth is on, and try again'
+            throw 'The device does not offer an Object Push service to this script. Make sure the device is paired, unlocked, Bluetooth is on, and try again'
         }
         $svc = $services[0]
 
