@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet('paired', 'scan', 'send', 'receive')]
+    [ValidateSet('paired', 'scan', 'send', 'receive', 'chathost', 'chatjoin')]
     [string]$Mode = 'paired',
 
     [Parameter()]
@@ -23,7 +23,7 @@ param(
     [Parameter()]
     [switch]$Continuous,
 
-    # Receive mode: advertise this PC as discoverable while listening
+    # Receive / chathost mode: advertise this PC as discoverable while listening
     [Parameter()]
     [switch]$Discoverable,
 
@@ -33,7 +33,11 @@ param(
 
     # Scan mode: also list remembered devices that are not currently in range
     [Parameter()]
-    [switch]$ShowAll
+    [switch]$ShowAll,
+
+    # Chat modes: name shown to the other side
+    [Parameter()]
+    [string]$Nickname = $env:COMPUTERNAME
 )
 
 Set-StrictMode -Version Latest
@@ -357,7 +361,7 @@ function Get-TargetDevice {
         return $dev
     }
 
-    throw 'Specify -DeviceAddress or -DeviceName for send mode.'
+    throw 'Specify -DeviceAddress or -DeviceName for send / chatjoin mode.'
 }
 
 # ---------------------------------------------------------------------------
@@ -788,17 +792,184 @@ function Receive-BluetoothFile {
 }
 
 # ---------------------------------------------------------------------------
+# CHAT (real-time, line based, over an RFCOMM Serial Port connection)
+# ---------------------------------------------------------------------------
+
+# Runs an interactive chat on a connected socket. Messages are UTF-8 lines ending in \n.
+function Start-ChatSession {
+    param($Socket)
+
+    $streams = Get-NetStreams $Socket
+    $reader  = $streams.In
+    $writer  = $streams.Out
+
+    $enc     = New-Object System.Text.UTF8Encoding($false)
+    $decoder = $enc.GetDecoder()          # handles multi-byte characters split across packets
+    $buf     = New-Object byte[] 4096
+    $pending = ''
+    $line    = New-Object System.Text.StringBuilder
+    $quit    = $false
+
+    # Always one read in flight, so incoming messages show up the moment they arrive
+    $readTask = $reader.ReadAsync($buf, 0, $buf.Length)
+
+    Write-Host 'Connected. Type a message and press Enter. Type /quit to leave.' -ForegroundColor Green
+    Write-Host '> ' -NoNewline
+
+    try {
+        while (-not $quit) {
+
+            # ---- incoming data ----
+            if ($readTask.IsCompleted) {
+                if ($readTask.IsFaulted -or $readTask.IsCanceled) { throw 'Connection lost.' }
+                $n = $readTask.Result
+                if ($n -le 0) {
+                    Write-Host ''
+                    Write-Host 'The other side disconnected.' -ForegroundColor Yellow
+                    break
+                }
+
+                $chars = New-Object char[] ($n + 4)
+                $cnt = $decoder.GetChars($buf, 0, $n, $chars, 0)
+                $pending += [string]::new($chars, 0, $cnt)
+                $readTask = $reader.ReadAsync($buf, 0, $buf.Length)
+
+                while (($idx = $pending.IndexOf("`n")) -ge 0) {
+                    $msg = $pending.Substring(0, $idx).TrimEnd("`r")
+                    $pending = $pending.Substring($idx + 1)
+                    if ($msg.Length -eq 0) { continue }
+
+                    # wipe the current input line, print the message, redraw the input line
+                    $w = [Math]::Max(10, [Console]::WindowWidth - 1)
+                    Write-Host ("`r" + (' ' * $w) + "`r") -NoNewline
+                    Write-Host $msg -ForegroundColor Yellow
+                    Write-Host ('> ' + $line.ToString()) -NoNewline
+                }
+            }
+
+            # ---- keyboard ----
+            while ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+
+                if ($key.Key -eq 'Enter') {
+                    $text = $line.ToString().Trim()
+                    [void]$line.Clear()
+                    Write-Host ''
+                    if ($text -eq '/quit') { $quit = $true; break }
+                    if ($text.Length -gt 0) {
+                        $bytes = $enc.GetBytes("${Nickname}: $text`n")
+                        $writer.Write($bytes, 0, $bytes.Length)
+                        $writer.Flush()
+                    }
+                    Write-Host '> ' -NoNewline
+                }
+                elseif ($key.Key -eq 'Backspace') {
+                    if ($line.Length -gt 0) {
+                        [void]$line.Remove($line.Length - 1, 1)
+                        Write-Host "`b `b" -NoNewline
+                    }
+                }
+                elseif (-not [char]::IsControl($key.KeyChar)) {
+                    [void]$line.Append($key.KeyChar)
+                    Write-Host $key.KeyChar -NoNewline
+                }
+            }
+
+            Start-Sleep -Milliseconds 10
+        }
+    }
+    finally {
+        $Socket.Dispose()
+    }
+}
+
+# Wait for another device to connect, then chat.
+function Start-ChatHost {
+    Write-Section 'Bluetooth chat (host)'
+
+    $sid = [Windows.Devices.Bluetooth.Rfcomm.RfcommServiceId]::SerialPort
+    $provider = Await-Op ([Windows.Devices.Bluetooth.Rfcomm.RfcommServiceProvider]::CreateAsync($sid)) ([Windows.Devices.Bluetooth.Rfcomm.RfcommServiceProvider])
+
+    $listener = New-Object Windows.Networking.Sockets.StreamSocketListener
+    $queue = New-Object WinRtEventQueue
+    $advertising = $false
+
+    try {
+        $queue.Subscribe($listener, 'ConnectionReceived')
+
+        Await-Action ($listener.BindServiceNameAsync(
+            $provider.ServiceId.AsString(),
+            [Windows.Networking.Sockets.SocketProtectionLevel]::BluetoothEncryptionAllowNullAuthentication))
+
+        $provider.StartAdvertising($listener, [bool]$Discoverable)
+        $advertising = $true
+
+        Write-Host "Nickname: $Nickname"
+        Write-Host 'Waiting for someone to connect (Serial Port service)... Ctrl+C to cancel.'
+        if (-not $Discoverable) {
+            Write-Host 'Tip: the other device should already be paired with this PC (or use -Discoverable).'
+        }
+
+        $evArgs = $null
+        while ($null -eq $evArgs) { $evArgs = $queue.Take(500) }
+
+        Start-ChatSession -Socket $evArgs.Socket
+    }
+    finally {
+        if ($advertising) { try { $provider.StopAdvertising() } catch { } }
+        $listener.Dispose()
+    }
+}
+
+# Connect to a paired device that is hosting a chat, then chat.
+function Start-ChatJoin {
+    $dev = Get-TargetDevice
+    $socket = $null
+    try {
+        Write-Section 'Bluetooth chat (join)'
+        Write-Host ("Target: {0} [{1:X12}]" -f $dev.Name, $dev.BluetoothAddress)
+        Write-Host "Nickname: $Nickname"
+
+        $sid = [Windows.Devices.Bluetooth.Rfcomm.RfcommServiceId]::SerialPort
+        $res = Await-Op ($dev.GetRfcommServicesForIdAsync($sid, [Windows.Devices.Bluetooth.BluetoothCacheMode]::Uncached)) ([Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceServicesResult])
+        if ($res.Error.ToString() -ne 'Success') { throw "Could not query the device's services: $($res.Error)" }
+        $services = @($res.Services)
+        if ($services.Count -eq 0) {
+            throw 'The device does not offer a Serial Port service. Start -Mode chathost on it first.'
+        }
+        $svc = $services[0]
+
+        Write-Host 'Connecting...'
+        $socket = New-Object Windows.Networking.Sockets.StreamSocket
+        Await-Action ($socket.ConnectAsync($svc.ConnectionHostName, $svc.ConnectionServiceName))
+
+        Start-ChatSession -Socket $socket
+        $socket = $null          # session disposed it
+    }
+    finally {
+        if ($null -ne $socket) { $socket.Dispose() }
+        if ($null -ne $dev)    { $dev.Dispose() }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 try {
+    Write-Host ''
+    Write-Host 'Win BTComms CLI' -ForegroundColor Cyan
+    Write-Host '---------------' -ForegroundColor DarkCyan
+
     Initialize-WinRT
 
     switch ($Mode) {
-        'paired'  { Show-Devices }
-        'scan'    { Show-LiveScan }
-        'send'    { Send-BluetoothFile }
-        'receive' { Receive-BluetoothFile }
+        'paired'   { Show-Devices }
+        'scan'     { Show-LiveScan }
+        'send'     { Send-BluetoothFile }
+        'receive'  { Receive-BluetoothFile }
+        'chathost' { Start-ChatHost }
+        'chatjoin' { Start-ChatJoin }
     }
 }
 catch {
