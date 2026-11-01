@@ -1,5 +1,7 @@
 # Win BTComms CLI
 
+A lightweight, dependency-free Windows CLI tool for Bluetooth file transfer, with basic chat support.
+
 ## Usage
 
 ```powershell
