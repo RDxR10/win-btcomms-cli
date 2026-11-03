@@ -721,7 +721,7 @@ function Invoke-ObexServerSession {
 
 function Receive-BluetoothFile {
     $dir = $SaveDir
-    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = 'D:\Users\User\Downloads' }
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Join-Path $env:USERPROFILE 'Downloads' }
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
