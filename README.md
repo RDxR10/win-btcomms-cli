@@ -22,6 +22,13 @@ powershell -ep bypass -f .\win_btcomms.ps1 -Mode scan -ScanSeconds 30
 powershell -ep bypass -f .\win_btcomms.ps1 -Mode scan -ScanSeconds 30 -ShowAll
 ```
 
+### Scan for Bluetooth Low Energy (BLE) advertisements
+
+```powershell
+powershell -ep bypass -f .\win_btcomms.ps1 -Mode blescan
+powershell -ep bypass -f .\win_btcomms.ps1 -Mode blescan -ScanSeconds 30
+```
+
 ### Send a file
 
 ```powershell
