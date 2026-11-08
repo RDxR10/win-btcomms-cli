@@ -106,7 +106,7 @@ Write-Host '=== Environment ===' -ForegroundColor Cyan
 Write-Host ("PSVersion : {0}" -f $PSVersionTable.PSVersion)
 Write-Host ("PSEdition : {0}" -f $PSVersionTable.PSEdition)
 Write-Host ("Script    : {0}" -f $ScriptPath)
-Write-Host ("Hardware  : {0}" -f $(if ($IncludeHardware) { 'ENABLED' } else { 'disabled' }))
+Write-Host ("Hardware  : {0}" -f $(if ($IncludeHardware) { 'included' } else { 'not included (use -IncludeHardware)' }))
 
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
     Write-Host 'This test suite requires Windows PowerShell 5.1 (powershell.exe).' -ForegroundColor Red
@@ -375,12 +375,67 @@ Test-Case 'Mode parameter declares the expected ValidateSet' {
     Assert-True ($null -ne $validateSet) 'ValidateSet attribute not found on -Mode.'
 
     $values = @($validateSet.PositionalArguments | ForEach-Object { $_.Value })
-    $expected = @('paired', 'scan', 'send', 'receive', 'chathost', 'chatjoin')
+    $expected = @('paired', 'scan', 'send', 'receive', 'chathost', 'chatjoin', 'blescan')
 
     foreach ($value in $expected) {
         Assert-True ($values -contains $value) "ValidateSet missing '$value'."
     }
     Assert-Equal $expected.Count $values.Count
+}
+Test-Case 'blescan mode is dispatched to Show-BleScan' {
+    $mainText = Get-Content -LiteralPath $ScriptPath -Raw
+    Assert-True ($mainText -match "(?m)'blescan'\s*\{\s*Show-BleScan\s*\}") `
+        'The main mode switch does not dispatch blescan to Show-BleScan.'
+}
+Test-Case 'Show-BleScan uses the Windows BLE Advertisement namespace' {
+    $bleFunction = $functionAsts | Where-Object { $_.Name -eq 'Show-BleScan' } | Select-Object -First 1
+    Assert-True ($null -ne $bleFunction) 'Show-BleScan function not found.'
+    $bleText = $bleFunction.Extent.Text
+    Assert-True ($bleText -match 'Windows\.Devices\.Bluetooth\.Advertisement\.BluetoothLEAdvertisementWatcher') `
+        'BLE watcher type must use the Bluetooth.Advertisement namespace.'
+    Assert-True ($bleText -match 'Windows\.Devices\.Bluetooth\.Advertisement\.BluetoothLEScanningMode') `
+        'BLE scanning mode type must use the Bluetooth.Advertisement namespace.'
+}
+Test-Case 'Show-BleScan subscribes to Received events and stops the watcher in finally' {
+    $bleFunction = $functionAsts | Where-Object { $_.Name -eq 'Show-BleScan' } | Select-Object -First 1
+    Assert-True ($null -ne $bleFunction) 'Show-BleScan function not found.'
+    $bleText = $bleFunction.Extent.Text
+    Assert-True ($bleText.Contains("`$receivedQ.Subscribe(`$watcher, 'Received')")) `
+        'BLE watcher is not subscribed to Received events.'
+    Assert-True ($bleText -match '\$watcher\.Start\(\)') 'BLE watcher is never started.'
+
+    $tryStatements = $bleFunction.Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.TryStatementAst]
+    }, $true)
+    $stoppedInFinally = $false
+    foreach ($tryStatement in $tryStatements) {
+        if ($null -ne $tryStatement.Finally -and
+            $tryStatement.Finally.Extent.Text -match '\$watcher\.Stop\(\)') {
+            $stoppedInFinally = $true
+            break
+        }
+    }
+    Assert-True $stoppedInFinally `
+        'BLE watcher must be stopped inside a finally block so cleanup also runs after errors.'
+}
+Test-Case 'Show-BleScan reports RSSI, estimated distance, and sample count' {
+    $bleFunction = $functionAsts | Where-Object { $_.Name -eq 'Show-BleScan' } | Select-Object -First 1
+    Assert-True ($null -ne $bleFunction) 'Show-BleScan function not found.'
+    $bleText = $bleFunction.Extent.Text
+    foreach ($field in @('RawSignalStrengthInDBm', 'EstimatedDistance', 'Samples')) {
+        Assert-True ($bleText -match [regex]::Escape($field)) "BLE scan output is missing '$field'."
+    }
+    Assert-True ($bleText -match 'rough RSSI-based estimate') `
+        'BLE scan should clarify that distance is only an estimate.'
+}
+Test-Case 'BLE WinRT type references are scoped to Show-BleScan' {
+    $mainText = Get-Content -LiteralPath $ScriptPath -Raw
+    $bleFunction = $functionAsts | Where-Object { $_.Name -eq 'Show-BleScan' } | Select-Object -First 1
+    Assert-True ($null -ne $bleFunction) 'Show-BleScan function not found.'
+    $outsideBle = $mainText.Replace($bleFunction.Extent.Text, '')
+    Assert-False ($outsideBle -match 'BluetoothLEAdvertisementWatcher|BluetoothLEScanningMode') `
+        'BLE-specific WinRT type references should not be loaded by Classic scan initialization.'
 }
 Test-Case 'Script declares CmdletBinding' {
     $paramAst = $ast.ParamBlock
@@ -525,201 +580,212 @@ Test-Case 'chatjoin with unknown paired name reports an error' {
 }
 
 Write-Host ''
+if ($IncludeHardware) {
 Write-Host '=== Hardware smoke test ===' -ForegroundColor Cyan
 
-if (-not $IncludeHardware) {
-    Skip-Case 'paired mode enumerates devices through the Windows Bluetooth stack' 'pass -IncludeHardware to enable'
-    Skip-Case 'scan mode runs against the Windows Bluetooth stack' 'pass -IncludeHardware to enable'
+$radio = $null
+$radioQuerySucceeded = $false
+
+try {
+    $bluetoothDevices = @(
+        Get-PnpDevice -Class Bluetooth -PresentOnly -ErrorAction Stop
+    )
+    $radioQuerySucceeded = $true
+
+
+    $radio = $bluetoothDevices |
+        Where-Object {
+            $_.FriendlyName -match 'Bluetooth' -and
+            $_.FriendlyName -notmatch 'Enumerator'
+        } |
+        Select-Object -First 1
+}
+catch {
+    Write-Host ("  Bluetooth PnP query unavailable: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+}
+
+if (-not $radioQuerySucceeded) {
+    Skip-Case 'paired mode enumerates devices through the Windows Bluetooth stack' 'could not query present Bluetooth PnP devices'
+    Skip-Case 'scan mode runs against the Windows Bluetooth stack' 'could not query present Bluetooth PnP devices'
+    Skip-Case 'blescan mode starts the Windows BLE watcher' 'could not query present Bluetooth PnP devices'
+}
+elseif ($null -eq $radio) {
+    Skip-Case 'paired mode enumerates devices through the Windows Bluetooth stack' 'no Bluetooth adapter detected'
+    Skip-Case 'scan mode runs against the Windows Bluetooth stack' 'no Bluetooth adapter detected'
+    Skip-Case 'blescan mode starts the Windows BLE watcher' 'no Bluetooth adapter detected'
 }
 else {
-    $radio = $null
-    $radioQuerySucceeded = $false
+    Write-Host ("  Adapter: {0} (PnP status: {1})" -f
+        $radio.FriendlyName, $radio.Status) -ForegroundColor DarkGray
 
-    try {
-        $bluetoothDevices = @(
-            Get-PnpDevice -Class Bluetooth -PresentOnly -ErrorAction Stop
+
+    Test-Case '-Mode paired enumerates devices through the Windows Bluetooth stack' {
+        $result = Invoke-Main -MainArgs @('-Mode', 'paired')
+
+        Assert-Equal 0 $result.ExitCode (
+            "Unexpected exit code: $($result.ExitCode). Output: $($result.Output)"
         )
-        $radioQuerySucceeded = $true
+        Assert-False ($result.Output -match '(?m)^ERROR:') "Script errored: $($result.Output)"
+        Assert-True ($result.Output -match 'Paired Bluetooth devices') `
+            'Did not reach the paired-devices section.'
 
+        $hasEmpty = $result.Output -match 'No paired devices found'
+        $hasTable = $result.Output -match '(?m)^\s*Name\s+Address\s+Paired\s+Connected\s*$'
 
-        $radio = $bluetoothDevices |
-            Where-Object {
-                $_.FriendlyName -match 'Bluetooth' -and
-                $_.FriendlyName -notmatch 'Enumerator'
-            } |
-            Select-Object -First 1
-    }
-    catch {
-        Write-Host ("  Bluetooth PnP query unavailable: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-    }
+        Assert-True ($hasTable -or $hasEmpty) "Unexpected paired-mode output: $($result.Output)"
 
-    if (-not $radioQuerySucceeded) {
-        Skip-Case 'paired mode enumerates devices through the Windows Bluetooth stack' 'could not query present Bluetooth PnP devices'
-        Skip-Case 'scan mode runs against the Windows Bluetooth stack' 'could not query present Bluetooth PnP devices'
-    }
-    elseif ($null -eq $radio) {
-        Skip-Case 'paired mode enumerates devices through the Windows Bluetooth stack' 'no Bluetooth adapter detected'
-        Skip-Case 'scan mode runs against the Windows Bluetooth stack' 'no Bluetooth adapter detected'
-    }
-    else {
-        Write-Host ("  Adapter: {0} (PnP status: {1})" -f
-            $radio.FriendlyName, $radio.Status) -ForegroundColor DarkGray
-
-
-        Test-Case '-Mode paired enumerates devices through the Windows Bluetooth stack' {
-            $result = Invoke-Main -MainArgs @('-Mode', 'paired')
-
-            Assert-Equal 0 $result.ExitCode (
-                "Unexpected exit code: $($result.ExitCode). Output: $($result.Output)"
-            )
-            Assert-False ($result.Output -match '(?m)^ERROR:') "Script errored: $($result.Output)"
-            Assert-True ($result.Output -match 'Paired Bluetooth devices') `
-                'Did not reach the paired-devices section.'
-
-            $hasEmpty = $result.Output -match 'No paired devices found'
-            $hasTable = $result.Output -match '(?m)^\s*Name\s+Address\s+Paired\s+Connected\s*$'
-
-            Assert-True ($hasTable -or $hasEmpty) "Unexpected paired-mode output: $($result.Output)"
-
-            if ($hasEmpty) {
-                Write-Host '  (no paired devices found; valid result)' -ForegroundColor DarkGray
-                return
-            }
-
-            $lines = $result.Output -split "`r?`n"
-            $headerIndex = -1
-
-            for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($lines[$i] -match '^\s*Name\s+Address\s+Paired\s+Connected\s*$') {
-                    $headerIndex = $i
-                    break
-                }
-            }
-
-            Assert-True ($headerIndex -ge 0) 'Paired-device table header not found.'
-
-            $dataStart = $headerIndex + 1
-            if ($dataStart -lt $lines.Count -and $lines[$dataStart] -match '^\s*-+') {
-                $dataStart++
-            }
-
-            $rows = @()
-            $badRows = @()
-
-            for ($i = $dataStart; $i -lt $lines.Count; $i++) {
-                $line = $lines[$i]
-
-                if ([string]::IsNullOrWhiteSpace($line)) { break }
-
-                if ($line -match '^\s*(?<Name>.+?)\s+(?<Address>[0-9A-Fa-f]{12}|\?)\s+(?<Paired>True|False)\s+(?<Connected>True|False|\?)\s*$') {
-                    $rows += [pscustomobject]@{
-                        Name      = $Matches['Name'].Trim()
-                        Address   = $Matches['Address']
-                        Paired    = $Matches['Paired']
-                        Connected = $Matches['Connected']
-                    }
-                }
-                else {
-                    $badRows += $line
-                }
-            }
-
-            Assert-True ($rows.Count -gt 0) 'No paired-device rows were parsed.'
-            Assert-Equal 0 $badRows.Count "Unrecognized paired-device rows: $($badRows -join '; ')"
-
-            foreach ($row in $rows) {
-                Assert-True (
-                    $row.Address -eq '?' -or
-                    $row.Address -match '^[0-9A-Fa-f]{12}$'
-                ) "Invalid address for '$($row.Name)': $($row.Address)"
-
-                Assert-Equal 'True' $row.Paired "Device '$($row.Name)' is not marked as paired."
-                Assert-True ($row.Connected -in @('True', 'False', '?')) `
-                    "Invalid connection state for '$($row.Name)': $($row.Connected)"
-            }
-
-            Write-Host ("  Validated {0} paired-device row(s)." -f $rows.Count) -ForegroundColor DarkGray
+        if ($hasEmpty) {
+            Write-Host '  (no paired devices found; valid result)' -ForegroundColor DarkGray
+            return
         }
 
+        $lines = $result.Output -split "`r?`n"
+        $headerIndex = -1
 
-
-        Test-Case '-Mode scan runs a live Bluetooth discovery session' {
-            $result = Invoke-Main -MainArgs @('-Mode', 'scan', '-ScanSeconds', '3')
-
-            Assert-Equal 0 $result.ExitCode (
-                "Unexpected exit code: $($result.ExitCode). Output: $($result.Output)"
-            )
-            Assert-False ($result.Output -match '(?m)^ERROR:') "Script errored: $($result.Output)"
-            Assert-True ($result.Output -match 'Live Bluetooth scan \(3 seconds\)') `
-                'Did not reach the live Bluetooth scan section.'
-
-            $hasEmpty = $result.Output -match 'No devices in range'
-            $hasTable = $result.Output -match '(?m)^\s*Name\s+Address\s+InRange\s+Paired\s+Connected\s*$'
-
-            Assert-True ($hasEmpty -or $hasTable) "Unexpected scan output: $($result.Output)"
-
-            if ($hasEmpty) {
-                Write-Host '  (no nearby devices discovered; valid scan result)' -ForegroundColor DarkGray
-                return
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*Name\s+Address\s+Paired\s+Connected\s*$') {
+                $headerIndex = $i
+                break
             }
-
-            $lines = $result.Output -split "`r?`n"
-            $headerIndex = -1
-
-            for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($lines[$i] -match '^\s*Name\s+Address\s+InRange\s+Paired\s+Connected\s*$') {
-                    $headerIndex = $i
-                    break
-                }
-            }
-
-            Assert-True ($headerIndex -ge 0) 'Live-scan table header not found.'
-
-            $dataStart = $headerIndex + 1
-            if ($dataStart -lt $lines.Count -and $lines[$dataStart] -match '^\s*-+') {
-                $dataStart++
-            }
-
-            $rows = @()
-            $badRows = @()
-
-            for ($i = $dataStart; $i -lt $lines.Count; $i++) {
-                $line = $lines[$i]
-                if ([string]::IsNullOrWhiteSpace($line)) { break }
-
-                if ($line -match '^\s*(?<Name>.+?)\s+(?<Address>[0-9A-Fa-f]{12}|\?)\s+(?<InRange>True|False)\s+(?<Paired>True|False)\s+(?<Connected>True|False)\s*$') {
-                    $rows += [pscustomobject]@{
-                        Name      = $Matches['Name'].Trim()
-                        Address   = $Matches['Address']
-                        InRange   = $Matches['InRange']
-                        Paired    = $Matches['Paired']
-                        Connected = $Matches['Connected']
-                    }
-                }
-                else {
-                    $badRows += $line
-                }
-            }
-
-            Assert-True ($rows.Count -gt 0) 'Scan table was displayed but no device rows were parsed.'
-            Assert-Equal 0 $badRows.Count "Unrecognized scan rows: $($badRows -join '; ')"
-
-            foreach ($row in $rows) {
-                Assert-True (
-                    $row.Address -eq '?' -or
-                    $row.Address -match '^[0-9A-Fa-f]{12}$'
-                ) "Invalid scan address for '$($row.Name)': $($row.Address)"
-
-                Assert-Equal 'True' $row.InRange "Discovered device '$($row.Name)' is not marked in range."
-                Assert-True ($row.Paired -in @('True', 'False')) "Invalid paired state for '$($row.Name)'."
-                Assert-True ($row.Connected -in @('True', 'False')) "Invalid connection state for '$($row.Name)'."
-            }
-
-            Write-Host ("  Validated {0} discovered-device row(s)." -f $rows.Count) -ForegroundColor DarkGray
         }
+
+        Assert-True ($headerIndex -ge 0) 'Paired-device table header not found.'
+
+        $dataStart = $headerIndex + 1
+        if ($dataStart -lt $lines.Count -and $lines[$dataStart] -match '^\s*-+') {
+            $dataStart++
+        }
+
+        $rows = @()
+        $badRows = @()
+
+        for ($i = $dataStart; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+
+            if ([string]::IsNullOrWhiteSpace($line)) { break }
+
+            if ($line -match '^\s*(?<Name>.+?)\s+(?<Address>[0-9A-Fa-f]{12}|\?)\s+(?<Paired>True|False)\s+(?<Connected>True|False|\?)\s*$') {
+                $rows += [pscustomobject]@{
+                    Name      = $Matches['Name'].Trim()
+                    Address   = $Matches['Address']
+                    Paired    = $Matches['Paired']
+                    Connected = $Matches['Connected']
+                }
+            }
+            else {
+                $badRows += $line
+            }
+        }
+
+        Assert-True ($rows.Count -gt 0) 'No paired-device rows were parsed.'
+        Assert-Equal 0 $badRows.Count "Unrecognized paired-device rows: $($badRows -join '; ')"
+
+        foreach ($row in $rows) {
+            Assert-True (
+                $row.Address -eq '?' -or
+                $row.Address -match '^[0-9A-Fa-f]{12}$'
+            ) "Invalid address for '$($row.Name)': $($row.Address)"
+
+            Assert-Equal 'True' $row.Paired "Device '$($row.Name)' is not marked as paired."
+            Assert-True ($row.Connected -in @('True', 'False', '?')) `
+                "Invalid connection state for '$($row.Name)': $($row.Connected)"
+        }
+
+        Write-Host ("  Validated {0} paired-device row(s)." -f $rows.Count) -ForegroundColor DarkGray
+    }
+
+
+
+    Test-Case '-Mode scan runs a live Bluetooth discovery session' {
+        $result = Invoke-Main -MainArgs @('-Mode', 'scan', '-ScanSeconds', '3')
+
+        Assert-Equal 0 $result.ExitCode (
+            "Unexpected exit code: $($result.ExitCode). Output: $($result.Output)"
+        )
+        Assert-False ($result.Output -match '(?m)^ERROR:') "Script errored: $($result.Output)"
+        Assert-True ($result.Output -match 'Live Bluetooth scan \(3 seconds\)') `
+            'Did not reach the live Bluetooth scan section.'
+
+        $hasEmpty = $result.Output -match 'No devices in range'
+        $hasTable = $result.Output -match '(?m)^\s*Name\s+Address\s+InRange\s+Paired\s+Connected\s*$'
+
+        Assert-True ($hasEmpty -or $hasTable) "Unexpected scan output: $($result.Output)"
+
+        if ($hasEmpty) {
+            Write-Host '  (no nearby devices discovered; valid scan result)' -ForegroundColor DarkGray
+            return
+        }
+
+        $lines = $result.Output -split "`r?`n"
+        $headerIndex = -1
+
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*Name\s+Address\s+InRange\s+Paired\s+Connected\s*$') {
+                $headerIndex = $i
+                break
+            }
+        }
+
+        Assert-True ($headerIndex -ge 0) 'Live-scan table header not found.'
+
+        $dataStart = $headerIndex + 1
+        if ($dataStart -lt $lines.Count -and $lines[$dataStart] -match '^\s*-+') {
+            $dataStart++
+        }
+
+        $rows = @()
+        $badRows = @()
+
+        for ($i = $dataStart; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+            if ([string]::IsNullOrWhiteSpace($line)) { break }
+
+            if ($line -match '^\s*(?<Name>.+?)\s+(?<Address>[0-9A-Fa-f]{12}|\?)\s+(?<InRange>True|False)\s+(?<Paired>True|False)\s+(?<Connected>True|False)\s*$') {
+                $rows += [pscustomobject]@{
+                    Name      = $Matches['Name'].Trim()
+                    Address   = $Matches['Address']
+                    InRange   = $Matches['InRange']
+                    Paired    = $Matches['Paired']
+                    Connected = $Matches['Connected']
+                }
+            }
+            else {
+                $badRows += $line
+            }
+        }
+
+        Assert-True ($rows.Count -gt 0) 'Scan table was displayed but no device rows were parsed.'
+        Assert-Equal 0 $badRows.Count "Unrecognized scan rows: $($badRows -join '; ')"
+
+        foreach ($row in $rows) {
+            Assert-True (
+                $row.Address -eq '?' -or
+                $row.Address -match '^[0-9A-Fa-f]{12}$'
+            ) "Invalid scan address for '$($row.Name)': $($row.Address)"
+
+            Assert-Equal 'True' $row.InRange "Discovered device '$($row.Name)' is not marked in range."
+            Assert-True ($row.Paired -in @('True', 'False')) "Invalid paired state for '$($row.Name)'."
+            Assert-True ($row.Connected -in @('True', 'False')) "Invalid connection state for '$($row.Name)'."
+        }
+
+        Write-Host ("  Validated {0} discovered-device row(s)." -f $rows.Count) -ForegroundColor DarkGray
+    }
+
+    Test-Case '-Mode blescan starts the Windows BLE watcher' {
+        $result = Invoke-Main -MainArgs @('-Mode', 'blescan', '-ScanSeconds', '3')
+        Assert-Equal 0 $result.ExitCode ("Unexpected exit code: $($result.ExitCode). Output: $($result.Output)")
+        Assert-False ($result.Output -match '(?m)^ERROR:') "BLE scan errored: $($result.Output)"
+        Assert-True ($result.Output -match 'Bluetooth LE scan \(3 seconds\)') 'BLE scan section was not reached.'
+        Assert-True (
+            $result.Output -match 'No BLE advertisements received|Name\s+Address\s+RSSI\s+EstimatedDistance\s+Samples'
+        ) "BLE scan did not produce a recognized result: $($result.Output)"
     }
 }
 
+}
+else {
+    Skip-Case 'Bluetooth hardware smoke tests' 'use -IncludeHardware to run them'
+}
 
 Write-Host ''
 Write-Host '=== Summary ===' -ForegroundColor Cyan
