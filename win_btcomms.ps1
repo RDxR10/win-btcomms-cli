@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidateSet('paired', 'scan', 'send', 'receive', 'chathost', 'chatjoin')]
+    [ValidateSet('paired', 'scan', 'blescan', 'send', 'receive', 'chathost', 'chatjoin')]
     [string]$Mode = 'paired',
 
     [Parameter()]
@@ -273,8 +273,11 @@ function Show-LiveScan {
 
     $addedQ   = New-Object WinRtEventQueue
     $updatedQ = New-Object WinRtEventQueue
+    $removedQ = New-Object WinRtEventQueue
+
     $addedQ.Subscribe($watcher, 'Added')
     $updatedQ.Subscribe($watcher, 'Updated')
+    $removedQ.Subscribe($watcher, 'Removed')
 
     $devices = @{}
 
@@ -282,11 +285,25 @@ function Show-LiveScan {
         if (-not $devices.ContainsKey($id)) {
             $devices[$id] = [pscustomobject]@{ Id = $id; Name = $name; Present = $null; Paired = $null; Connected = $null }
         }
+
         $d = $devices[$id]
-        if ($name) { $d.Name = $name }
-        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsPresent');   if ($null -ne $v) { $d.Present = [bool]$v }
-        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsPaired');    if ($null -ne $v) { $d.Paired = [bool]$v }
-        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsConnected'); if ($null -ne $v) { $d.Connected = [bool]$v }
+        if (-not [string]::IsNullOrWhiteSpace($name)) { $d.Name = $name }
+
+        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsPresent')
+        if ($null -ne $v) { $d.Present = [bool]$v }
+
+        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsPaired')
+        if ($null -ne $v) { $d.Paired = [bool]$v }
+
+        $v = [WinRtEventQueue]::GetProperty($source, 'System.Devices.Aep.IsConnected')
+        if ($null -ne $v) { $d.Connected = [bool]$v }
+    }
+
+    function Set-ScanRemoved($id) {
+        if ($devices.ContainsKey($id)) {
+            $devices[$id].Present = $false
+            $devices[$id].Connected = $false
+        }
     }
 
     try {
@@ -296,11 +313,14 @@ function Show-LiveScan {
             $left = [int]($end - (Get-Date)).TotalSeconds
             Write-Progress -Activity 'Scanning for Bluetooth devices' -Status "$left s left - found $($devices.Count)" -PercentComplete ([int](100 * (1 - $left / [double]$ScanSeconds)))
 
-            $a = $addedQ.Take(150)
+            $a = $addedQ.Take(100)
             if ($null -ne $a) { Set-ScanState $a.Id $a $a.Name }
 
-            $u = $updatedQ.Take(150)
+            $u = $updatedQ.Take(100)
             if ($null -ne $u) { Set-ScanState $u.Id $u $null }
+
+            $r = $removedQ.Take(100)
+            if ($null -ne $r) { Set-ScanRemoved $r.Id }
         }
     }
     finally {
@@ -311,7 +331,12 @@ function Show-LiveScan {
     $rows = @()
     foreach ($d in $devices.Values) {
         $addr = Get-AddressFromId $d.Id
-        $inRange = ($d.Present -ne $false)            # unknown counts as in range
+
+        # Only report InRange = True when Windows explicitly confirms presence.
+        # Unknown presence is not treated as in range.
+        # Not fully done. Changes needed.
+        $inRange = ($d.Present -eq $true)
+
         if (-not $inRange -and -not $ShowAll) { continue }
 
         $isPaired = ($d.Paired -eq $true) -or ($addr -ne '?' -and $pairedAddr.ContainsKey($addr))
@@ -331,6 +356,85 @@ function Show-LiveScan {
     }
     $rows | Sort-Object @{Expression = 'InRange'; Descending = $true}, Name | Format-Table -AutoSize
     
+}
+
+function Show-BleScan {
+    # Load BLE-specific WinRT types only when BLE scanning is requested.
+    # Classic scanning must not depend on these types being available.
+    $null = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode,         Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+
+    Write-Section "Bluetooth LE scan ($ScanSeconds seconds)"
+    Write-Host 'Scanning for BLE advertisements. Only devices actively advertising will appear.' -ForegroundColor DarkYellow
+
+    # Windows reports BLE RSSI for each received advertisement. This is not available
+    # through the Classic Bluetooth DeviceWatcher used by -Mode scan.
+    $watcher = New-Object Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher
+    $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Active
+    $receivedQ = New-Object WinRtEventQueue
+    $receivedQ.Subscribe($watcher, 'Received')
+
+    $devices = @{}
+    try {
+        $watcher.Start()
+        $end = (Get-Date).AddSeconds($ScanSeconds)
+        while ((Get-Date) -lt $end) {
+            $ev = $receivedQ.Take(200)
+            if ($null -eq $ev) { continue }
+
+            $address = '{0:X12}' -f $ev.BluetoothAddress
+            $name = $ev.Advertisement.LocalName
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = '(name not advertised)' }
+            $rssi = [int]$ev.RawSignalStrengthInDBm
+
+            # Approximation only: assumes -59 dBm at 1 metre and path-loss exponent 2.
+            # Real-world distance varies with walls, interference, antenna orientation,
+            # transmit power and the device itself.
+            $distance = [Math]::Pow(10, ((-59.0 - $rssi) / 20.0))
+
+            if (-not $devices.ContainsKey($address)) {
+                $devices[$address] = [pscustomobject]@{
+                    Name = $name
+                    Address = $address
+                    RSSI = $rssi
+                    DistanceM = $distance
+                    Samples = 1
+                    LastSeen = Get-Date
+                }
+            }
+            else {
+                $d = $devices[$address]
+                $d.Name = $name
+                # Smooth short-term RSSI fluctuations using a running average.
+                $d.RSSI = [int][Math]::Round((($d.RSSI * $d.Samples) + $rssi) / ($d.Samples + 1))
+                $d.Samples++
+                $d.DistanceM = [Math]::Pow(10, ((-59.0 - $d.RSSI) / 20.0))
+                $d.LastSeen = Get-Date
+            }
+        }
+    }
+    finally {
+        try { $watcher.Stop() } catch { }
+        Write-Progress -Activity 'Scanning for Bluetooth LE devices' -Completed
+    }
+
+    if ($devices.Count -eq 0) {
+        Write-Host 'No BLE advertisements received.' -ForegroundColor Yellow
+        Write-Host 'The device may not support BLE, may not be advertising, or may be undiscoverable to this scan.'
+        return
+    }
+
+    $rows = foreach ($d in $devices.Values) {
+        [pscustomobject]@{
+            Name = $d.Name
+            Address = $d.Address
+            RSSI = "$($d.RSSI) dBm"
+            EstimatedDistance = ('~{0:N1} m' -f $d.DistanceM)
+            Samples = $d.Samples
+        }
+    }
+    $rows | Sort-Object { [int]($_.RSSI -replace ' dBm','') } -Descending | Format-Table -AutoSize
+    Write-Host 'Distance is a rough RSSI-based estimate, not an exact physical measurement.' -ForegroundColor DarkYellow
 }
 
 function ConvertTo-CleanAddress {
@@ -966,6 +1070,7 @@ try {
     switch ($Mode) {
         'paired'   { Show-Devices }
         'scan'     { Show-LiveScan }
+        'blescan'  { Show-BleScan }
         'send'     { Send-BluetoothFile }
         'receive'  { Receive-BluetoothFile }
         'chathost' { Start-ChatHost }
